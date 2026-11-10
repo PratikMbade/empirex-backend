@@ -1,0 +1,323 @@
+// EmpireX indexer + API schema.
+//
+// Conventions
+// - Addresses are stored lowercase.
+// - Token amounts are stored in token units (not wei) as exact decimals.
+// - Every row written from a contract log carries (txHash, logIndex), which is
+//   unique, so replaying a block range never creates duplicates.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Indexer bookkeeping ──────────────────────────────────────────────────────
+
+/// One row per indexer; holds the last block whose logs are fully stored.
+model IndexerState {
+  id        String   @id
+  lastBlock BigInt
+  updatedAt DateTime @updatedAt
+}
+
+/// Every decoded contract log, stored in the same DB transaction as the rows
+/// derived from it. Its presence marks the log as processed.
+model ContractLog {
+  id          String   @id @default(cuid())
+  blockNumber BigInt
+  blockTime   DateTime
+  txHash      String
+  logIndex    Int
+  eventName   String
+  args        Json
+  createdAt   DateTime @default(now())
+
+  @@unique([txHash, logIndex])
+  @@index([blockNumber])
+  @@index([eventName])
+}
+
+/// Package catalog read from the contract's matrixDetails(1..12) on indexer start.
+model PackageTier {
+  level     Int      @id
+  name      String
+  price     Decimal  @db.Decimal(38, 18)
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Members (RegisterEV + contract state) ────────────────────────────────────
+
+enum GenSide {
+  LEFT
+  RIGHT
+}
+
+model Member {
+  address          String   @id
+  regId            Int      @unique
+  /// Referrer from RegisterEV. The root member is its own sponsor.
+  sponsor          String
+  isRoot           Boolean  @default(false)
+  registeredAt     DateTime
+  regTxHash        String?
+  highestPackage   Int      @default(0)
+  /// Directs who reached package 4 (the contract's _eTeamCount); gates level income from L4.
+  qualifiedDirects Int      @default(0)
+
+  /// Position in the binary generation tree (contract InternalGenStr).
+  genParent   String?
+  genSide     GenSide?
+  genPlacedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  packages PackagePurchase[]
+
+  @@unique([genParent, genSide])
+  @@index([sponsor])
+  @@index([genParent])
+}
+
+model PackagePurchase {
+  id            String   @id @default(cuid())
+  memberAddress String
+  member        Member   @relation(fields: [memberAddress], references: [address])
+  package       Int
+  /// PackageBuyEV.currentId — the buyer's id within this package's queue.
+  packageBuyId  Int
+  price         Decimal  @db.Decimal(38, 18)
+  purchasedAt   DateTime
+  blockNumber   BigInt
+  txHash        String
+  logIndex      Int
+
+  @@unique([txHash, logIndex])
+  @@unique([memberAddress, package])
+}
+
+// ─── x3 matrix (50% of every package fee) ─────────────────────────────────────
+
+/// x3Distribution: `receiver` is the matrix owner whose slot the buyer took.
+/// A third-slot fill is not paid out — the contract keeps it and recycles the
+/// owner — so those rows have recycled = true and are not income.
+model X3Payment {
+  id          String   @id @default(cuid())
+  receiver    String
+  buyer       String
+  package     Int
+  amount      Decimal  @db.Decimal(38, 18)
+  /// The buyer's own chain number at the time (the event's `chain` arg).
+  buyerChain  Int
+  recycled    Boolean  @default(false)
+  paidAt      DateTime
+  blockNumber BigInt
+  txHash      String
+  logIndex    Int
+
+  @@unique([txHash, logIndex])
+  @@index([receiver, recycled])
+  @@index([buyer])
+}
+
+/// LapsPayEV, emitted for every x3 placement. `lapsed` is true when the
+/// buyer's sponsor had no open matrix for this package and the slot went to
+/// an upline instead (that upline's x3Lapse on chain).
+model X3Routing {
+  id          String   @id @default(cuid())
+  receiver    String
+  buyer       String
+  package     Int
+  amount      Decimal  @db.Decimal(38, 18)
+  depth       Int
+  lapsed      Boolean
+  routedAt    DateTime
+  blockNumber BigInt
+  txHash      String
+  logIndex    Int
+
+  @@unique([txHash, logIndex])
+  @@index([receiver])
+  @@index([buyer])
+}
+
+/// One row per address in LapsPayEV.lapAdd — members passed over for an x3 slot.
+model X3Lost {
+  id          String   @id @default(cuid())
+  lostBy      String
+  buyer       String
+  receiver    String
+  package     Int
+  amount      Decimal  @db.Decimal(38, 18)
+  position    Int
+  lostAt      DateTime
+  blockNumber BigInt
+  txHash      String
+  logIndex    Int
+
+  @@unique([txHash, logIndex, position])
+  @@index([lostBy])
+}
+
+model Recycle {
+  id          String   @id @default(cuid())
+  owner       String
+  /// The buyer whose purchase filled the third slot.
+  triggeredBy String
+  package     Int
+  /// The owner's new chain (cycle) number after recycling.
+  newCycle    Int
+  recycledAt  DateTime
+  blockNumber BigInt
+  txHash      String
+  logIndex    Int
+
+  @@unique([txHash, logIndex])
+  @@index([owner, package])
+}
+
+/// Mirror of x3MatrixDetails[owner][package][cycle], built from x3Distribution
+/// and Recycle in log order.
+model X3Matrix {
+  owner     String
+  package   Int
+  cycle     Int
+  slot1     String?
+  slot2     String?
+  slot3     String?
+  updatedAt DateTime @updatedAt
+
+  @@id([owner, package, cycle])
+}
+
+// ─── Level income (25% of every package fee, 12 generations) ──────────────────
+
+model LevelIncome {
+  id          String   @id @default(cuid())
+  receiver    String
+  buyer       String
+  package     Int
+  generation  Int
+  amount      Decimal  @db.Decimal(38, 18)
+  paidAt      DateTime
+  blockNumber BigInt
+  txHash      String
+  logIndex    Int
+
+  @@unique([txHash, logIndex])
+  @@index([receiver])
+  @@index([buyer])
+}
+
+/// LevellapseIncomeEV: a level cut that skipped ineligible uplines and was paid
+/// further up. `depth` is how far above the buyer the receiver sits.
+model LevelLapseIncome {
+  id          String   @id @default(cuid())
+  receiver    String
+  buyer       String
+  package     Int
+  depth       Int
+  amount      Decimal  @db.Decimal(38, 18)
+  paidAt      DateTime
+  blockNumber BigInt
+  txHash      String
+  logIndex    Int
+
+  @@unique([txHash, logIndex])
+  @@index([receiver])
+}
+
+/// One row per address in LevelLostIncomeEV.to — uplines that missed a level cut.
+model LevelLost {
+  id          String   @id @default(cuid())
+  lostBy      String
+  buyer       String
+  package     Int
+  generation  Int
+  amount      Decimal  @db.Decimal(38, 18)
+  position    Int
+  lostAt      DateTime
+  blockNumber BigInt
+  txHash      String
+  logIndex    Int
+
+  @@unique([txHash, logIndex, position])
+  @@index([lostBy])
+}
+
+// ─── better-auth (Sign-In with Ethereum) ──────────────────────────────────────
+// Separate from Member: a wallet can sign in before it registers on chain.
+
+model User {
+  id              String          @id
+  name            String
+  email           String          @unique
+  emailVerified   Boolean         @default(false)
+  image           String?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  sessions        Session[]
+  accounts        Account[]
+  walletAddresses WalletAddress[]
+}
+
+model Session {
+  id        String   @id
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  ipAddress String?
+  userAgent String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Account {
+  id                    String    @id
+  userId                String
+  accountId             String
+  providerId            String
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+}
+
+model WalletAddress {
+  id        String   @id
+  userId    String
+  address   String
+  chainId   Int
+  isPrimary Boolean  @default(false)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([address])
+}
