@@ -72,11 +72,27 @@ export interface TreeMember {
   memberId: string
   package: { level: number; name: string; price: number } | null
   generation: number
+  /** L12 Tree: direct referrals and whole referral downline. */
+  directCount?: number
+  teamSize?: number
   /** S3 Tree: this placement came from the member's own matrix recycling. */
   recycled?: boolean
   /** S3 Tree: this slot paid the matrix owner nothing. */
   noIncome?: boolean
   children: (TreeMember | null)[]
+}
+
+/** Each member's direct referrals and whole referral downline, in one query. Members with no team are left out. */
+export async function teamCounts(addresses: string[]) {
+  if (addresses.length === 0) return new Map<string, { directCount: number; teamSize: number }>()
+  const rows = await prisma.$queryRaw<{ root: string; directs: bigint; total: bigint }[]>`
+    WITH RECURSIVE team AS (
+      SELECT sponsor AS root, address, 1 AS depth FROM "Member" WHERE sponsor IN (${Prisma.join(addresses)}) AND address <> sponsor
+      UNION ALL
+      SELECT t.root, m.address, t.depth + 1 FROM "Member" m JOIN team t ON m.sponsor = t.address WHERE m.address <> m.sponsor
+    )
+    SELECT root, count(*) FILTER (WHERE depth = 1)::bigint AS directs, count(*)::bigint AS total FROM team GROUP BY root`
+  return new Map(rows.map((r) => [r.root, { directCount: Number(r.directs), teamSize: Number(r.total) }]))
 }
 
 export async function treeNodes(addresses: string[]) {

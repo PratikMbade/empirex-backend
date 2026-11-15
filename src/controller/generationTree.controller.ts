@@ -3,7 +3,7 @@ import type { Request, Response } from 'express'
 import { z } from 'zod'
 import { prisma } from '../lib/prisma.js'
 import { addressParam, HttpError, json } from '../utils/http.js'
-import { requireMember, treeNodes, type TreeMember } from '../utils/memberSummary.js'
+import { requireMember, teamCounts, treeNodes, type TreeMember } from '../utils/memberSummary.js'
 
 /** Binary generation tree (B_Matrix_L12_Details), `depth` generations below `root`. Children are [left, right]. */
 async function buildGenerationTree(root: string, depth: number): Promise<TreeMember> {
@@ -22,9 +22,12 @@ async function buildGenerationTree(root: string, depth: number): Promise<TreeMem
     frontier = rows.map((r) => r.address)
     all.push(...frontier)
   }
-  const nodes = await treeNodes(all)
+  const [nodes, counts] = await Promise.all([treeNodes(all), teamCounts(all)])
   const build = (address: string, generation: number): TreeMember => ({
     ...nodes.get(address)!,
+    // Referral team (sponsor chain), the same counts as the Empire Team page.
+    directCount: counts.get(address)?.directCount ?? 0,
+    teamSize: counts.get(address)?.teamSize ?? 0,
     generation,
     children: generation < depth ? (childrenOf.get(address) ?? [null, null]).map((c) => (c ? build(c, generation + 1) : null)) : [],
   })

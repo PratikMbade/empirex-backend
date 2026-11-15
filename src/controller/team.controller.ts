@@ -87,18 +87,30 @@ export const getTeam = async (req: Request, res: Response) => {
   ])
   const tierAt = new Map(tiers.map((t) => [t.level, t]))
 
-  // Total rewards per member on this page; the same streams as the member summary.
+  // Income by stream for each member on this page; the same streams as the member summary.
   const receivers = rows.map((m) => m.address)
-  const totals = await Promise.all([
+  const [x3, level, lapse, x3Lost, levelLost] = await Promise.all([
     prisma.x3Payment.groupBy({ by: ['receiver'], where: { receiver: { in: receivers }, recycled: false }, _sum: { amount: true } }),
     prisma.levelIncome.groupBy({ by: ['receiver'], where: { receiver: { in: receivers } }, _sum: { amount: true } }),
     prisma.levelLapseIncome.groupBy({ by: ['receiver'], where: { receiver: { in: receivers } }, _sum: { amount: true } }),
+    prisma.x3Lost.groupBy({ by: ['lostBy'], where: { lostBy: { in: receivers } }, _sum: { amount: true } }),
+    prisma.levelLost.groupBy({ by: ['lostBy'], where: { lostBy: { in: receivers } }, _sum: { amount: true } }),
   ])
-  const income = new Map<string, Prisma.Decimal>()
-  for (const row of totals.flat()) income.set(row.receiver, (income.get(row.receiver) ?? new Prisma.Decimal(0)).plus(row._sum.amount ?? 0))
+  const byAddress = (groups: { key: string; amount: Prisma.Decimal | null }[][]) => {
+    const totals = new Map<string, Prisma.Decimal>()
+    for (const { key, amount } of groups.flat()) totals.set(key, (totals.get(key) ?? new Prisma.Decimal(0)).plus(amount ?? 0))
+    return (address: string) => Number(totals.get(address) ?? 0)
+  }
+  const received = (g: { receiver: string; _sum: { amount: Prisma.Decimal | null } }[]) => g.map((r) => ({ key: r.receiver, amount: r._sum.amount }))
+  const missed = (g: { lostBy: string; _sum: { amount: Prisma.Decimal | null } }[]) => g.map((r) => ({ key: r.lostBy, amount: r._sum.amount }))
+  const directOf = byAddress([received(x3)])
+  const levelOf = byAddress([received(level)])
+  const lapseOf = byAddress([received(lapse)])
+  const lostOf = byAddress([missed(x3Lost), missed(levelLost)])
 
   const members = rows.map((m) => {
     const next = tierAt.get(m.highestPackage + 1)
+    const income = { direct: directOf(m.address), level: levelOf(m.address), lapse: lapseOf(m.address) }
     return {
       address: m.address,
       memberId: empirexId(m.address),
@@ -108,7 +120,11 @@ export const getTeam = async (req: Request, res: Response) => {
       level: m.highestPackage,
       packageName: tierAt.get(m.highestPackage)?.name ?? null,
       directCount: Number(m.directs),
-      totalIncome: Number(income.get(m.address) ?? 0),
+      totalIncome: income.direct + income.level + income.lapse,
+      /** Earned per stream (Magic Pool income is on chain; the dashboard reads it there). */
+      income,
+      /** S3 and level income missed because the member's rank was too low. Not part of totalIncome. */
+      lostIncome: lostOf(m.address),
       nextPackage: next ? { level: next.level, name: next.name, price: Number(next.price) } : null,
     }
   })
