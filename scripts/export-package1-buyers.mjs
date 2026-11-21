@@ -1,12 +1,17 @@
-// export-package1-buyers.mjs — CSV of everyone who bought package 1 ($2), oldest purchase first.
-// Read-only: it only runs a SELECT. Columns: serial_number, wallet_address, purchased_at_ist.
+// export-package1-buyers.mjs — CSV of everyone who bought a package (package 1, the $2 one, by default),
+// oldest purchase first. Read-only: it only runs SELECTs. Columns: serial_number, wallet_address, purchased_at_ist
+// (when they bought that package, in IST).
 //
 // Run from the backend folder (it reads DATABASE_URL from .env):
 //   node --env-file=.env scripts/export-package1-buyers.mjs
-//     → purchases up to today 11:00 PM IST, saved to package1_buyers_<date>.csv
-//   node --env-file=.env scripts/export-package1-buyers.mjs --until "2026-11-22 23:00"
-//     → purchases up to that IST date and time
-//   add --out my-file.csv to choose the file name.
+//     → package 1 buyers up to today 11:00 PM IST, saved to package1_buyers_<date>.csv
+//   node --env-file=.env scripts/export-package1-buyers.mjs --package 2 --only
+//     → members whose highest package is 2 (they bought 2 and nothing above it), saved to package2_only_<date>.csv
+// Options:
+//   --package N   which package (1–12). Default 1.
+//   --only        keep only members who have no package above N at the cutoff.
+//   --until "2026-11-22 23:00"   cutoff, read as IST. Default: today 11:00 PM IST.
+//   --out my-file.csv            file name.
 import { writeFileSync } from 'node:fs'
 import { PrismaClient } from '@prisma/client'
 
@@ -35,23 +40,38 @@ function formatIst(date) {
   return new Date(date.getTime() + IST_OFFSET_MINUTES * 60_000).toISOString().slice(0, 19).replace('T', ' ')
 }
 
+const pkg = Number(arg('--package') ?? 1)
+if (!Number.isInteger(pkg) || pkg < 1 || pkg > 12) throw new Error(`--package must be a number from 1 to 12, got "${arg('--package')}"`)
+const only = process.argv.includes('--only')
 const untilText = arg('--until') ?? `${todayIst()} 23:00`
 const until = parseIst(untilText)
-const out = arg('--out') ?? `package1_buyers_${untilText.slice(0, 10)}.csv`
+const out = arg('--out') ?? `package${pkg}_${only ? 'only' : 'buyers'}_${untilText.slice(0, 10)}.csv`
+const who = only ? `Members whose highest package is ${pkg}` : `Package ${pkg} buyers`
 
 const prisma = new PrismaClient()
 try {
-  const rows = await prisma.packagePurchase.findMany({
-    where: { package: 1, purchasedAt: { lte: until } },
+  let rows = await prisma.packagePurchase.findMany({
+    where: { package: pkg, purchasedAt: { lte: until } },
     orderBy: [{ purchasedAt: 'asc' }, { blockNumber: 'asc' }, { logIndex: 'asc' }],
     select: { memberAddress: true, purchasedAt: true },
   })
+
+  if (only) {
+    // Drop anyone who had already bought a higher package by the cutoff.
+    const higher = await prisma.packagePurchase.findMany({
+      where: { package: { gt: pkg }, purchasedAt: { lte: until } },
+      select: { memberAddress: true },
+      distinct: ['memberAddress'],
+    })
+    const upgraded = new Set(higher.map((h) => h.memberAddress))
+    rows = rows.filter((row) => !upgraded.has(row.memberAddress))
+  }
 
   const lines = ['serial_number,wallet_address,purchased_at_ist']
   rows.forEach((row, i) => lines.push(`${i + 1},${row.memberAddress},${formatIst(row.purchasedAt)}`))
   writeFileSync(out, `${lines.join('\n')}\n`)
 
-  console.log(`Package 1 buyers up to ${untilText} IST: ${rows.length}`)
+  console.log(`${who}, up to ${untilText} IST: ${rows.length}`)
   if (rows.length > 0) console.log(`First: ${formatIst(rows[0].purchasedAt)} IST   Last: ${formatIst(rows.at(-1).purchasedAt)} IST`)
   console.log(`Saved to ${out}`)
 } catch (err) {
